@@ -1,0 +1,27 @@
+# ROS 2 build artifacts
+build/
+install/
+log/
+
+# Colcon
+.colcon/
+
+# CLion / JetBrains
+.idea/
+cmake-build-*/
+
+# Compiled objects
+*.o
+*.so
+*.a
+
+# Python
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor backups
+*~
