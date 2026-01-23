@@ -2,7 +2,7 @@
 ================================================================================
 tracked_robot_hw :: motor_driver_node.cpp  (Phase 1 bring-up / hardware driver)
 
-WHAT THIS FILE IS (in first person)
+WHAT THIS FILE IS 
 - I wrote this ROS 2 node to talk directly to my motor driver board over Linux I²C.
 - I use it to do the board-required initialization sequence (encoder polarity + encoder reset),
   then I:
