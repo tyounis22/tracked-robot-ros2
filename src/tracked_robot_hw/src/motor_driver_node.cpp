@@ -1,124 +1,74 @@
 /*
 ================================================================================
-tracked_robot_hw :: motor_driver_node.cpp  (Phase 1 bring-up / hardware driver)
+tracked_robot_hw :: motor_driver_node.cpp  (Phase 1.3 - encoder odometry + cmd_vel)
 
-WHAT THIS FILE IS 
-- I wrote this ROS 2 node to talk directly to my motor driver board over Linux I²C.
-- I use it to do the board-required initialization sequence (encoder polarity + encoder reset),
-  then I:
-  (A) poll and print encoder totals periodically so I can validate encoders and mapping, and
-  (B) optionally run a simple open-loop PWM motion test (forward/stop/back/stop) to prove that
-      software → electronics → motion works end-to-end.
+Big picture
+- I wrote this node because I want ONE place that touches the raw motor driver registers.
+- I also want the rest of ROS2 to see my robot as "normal":
+    - it should accept /cmd_vel
+    - it should publish /odom
+    - it should publish TF odom -> base_link (so Nav2/SLAM/etc can plug in later)
 
-WHY I MADE IT
-- I needed a “hardware truth layer” for motion:
-  - This is the only place I let myself deal with the I²C bus path, slave address, and raw registers.
-  - Everything higher level I’ll build later (cmd_vel control, PID, odometry, navigation) depends on this
-    node being correct and predictable.
+My current physical setup (important)
+- I have ONLY two motors wired:
+    M1 = left track motor
+    M2 = right track motor
+    M3 and M4 are not wired (unused)
+- So I always force M3/M4 PWM to 0 when two_motor_mode=true.
 
-KEY IDEA: Linux I²C access
-- My motor driver is an I²C slave at address 0x34 on bus /dev/i2c-1.
-- Linux exposes I²C buses as device files (e.g., /dev/i2c-1).
-- The register pattern I’m using is:
-    1) I select a register by writing 1 byte (the register address)
-    2) I read or write the associated bytes
+What I calibrated already (measured constants)
+- Track circumference: 0.607 m for one full track revolution
+- Encoder counts for one revolution at that test:
+    M1 = -7194
+    M2 = -6694
+  => avg ticks per rev ~ 6944
+- meters_per_tick = 0.607 / 6944 ≈ 0.0000874 m per tick
+- I put meters_per_tick as a ROS parameter, defaulting to that value.
 
-BOARD-SPECIFIC RULES I LEARNED (from the docs you provided)
-- When I use register 0x15 (encoder polarity), I must set it to 0 or direction changes may not work.
-- When I reset encoder pulse totals, I must write sixteen bytes of 0x00 to register 0x3C.
-  (This matches 4 motors × 4 bytes each = 16 bytes.)
+What odometry means (what I’m computing)
+- Encoders give me ticks. I convert ticks -> meters using meters_per_tick.
+- Every update cycle I compute:
+    dl = (left_ticks_delta)  * meters_per_tick
+    dr = (right_ticks_delta) * meters_per_tick
 
-DATA ASSUMPTIONS (validated by “it moved”)
-- REG_ENCODER_TOTAL (0x3C) returns 16 bytes interpreted as:
-    M1_count(int32 little-endian), M2_count(int32 LE), M3_count(int32 LE), M4_count(int32 LE)
-- REG_MOTOR_FIXED_PWM (0x1F) accepts 4 signed bytes:
-    [M1_pwm, M2_pwm, M3_pwm, M4_pwm] each in range -100..100
-  This is open-loop power (no regulation).
+- Differential drive kinematics (tracked robot behaves like diff drive, just slips more):
+    ds     = (dr + dl) / 2
+    dtheta = (dr - dl) / track_width
 
-THE DIRECTION FIX I ADDED
-- My robot drove backward when I told it to go forward, so I added a parameter called direction_sign.
-- direction_sign can be +1 (normal) or -1 (inverted).
-- I apply direction_sign to every PWM value before writing to the motor driver.
-- This lets me fix forward/backward without rewiring and without editing code again:
-    ros2 run tracked_robot_hw motor_driver_node --ros-args -p direction_sign:=-1
+- Then I integrate pose in the odom frame:
+    x     += ds * cos(theta + dtheta/2)
+    y     += ds * sin(theta + dtheta/2)
+    theta += dtheta
 
-ROS BEHAVIOR
-- On startup I:
-    - Open the I²C bus file
-    - Select the I²C slave device address
-    - Initialize the board (polarity, motor type, encoder reset)
-    - Stop motors (safety)
-    - Start a timer that polls encoder totals at encoder_poll_hz
-    - Optionally schedule a one-time PWM test
-- On shutdown I:
-    - Stop motors (safety)
-    - Close the I²C file descriptor
+What track_width means here
+- track_width is the distance between left and right track centerlines in meters.
+- You measured 157mm, so default track_width=0.157.
+- Later I can refine track_width to an "effective" value by calibration, but this is a good start.
 
-FUNCTION-BY-FUNCTION WALKTHROUGH (what each function does)
+How /cmd_vel works in this node (for now)
+- /cmd_vel gives me a desired linear velocity v (m/s) and yaw rate w (rad/s).
+- Eventually I’ll do closed-loop velocity control (PID) using encoders.
+- For now I do a simple open-loop mapping:
+    left_cmd  = v - w*(track_width/2)
+    right_cmd = v + w*(track_width/2)
+  then convert m/s -> PWM using a gain (mps_to_pwm).
+- It’s crude, but it lets me drive from teleop and still get odom.
 
-(1) i2c_write_bytes(fd, data, len)
-    - I write raw bytes to the currently selected I²C slave.
-    - If this fails, it’s usually the wrong bus, permissions, missing hardware, or unstable wiring/power.
+Safety / sanity things I do
+- I set encoder polarity register 0x15 to 0 (per your docs) so direction changes work properly.
+- I reset encoder totals by writing 16 bytes of 0x00 to 0x3C.
+- I stop motors at startup and shutdown.
+- I implement a cmd_vel timeout: if commands stop arriving, I stop.
 
-(2) i2c_write_reg_block(fd, reg, data, len)
-    - I write a register plus its payload in one transaction:
-        [reg][payload...]
-    - I use this for: polarity, motor type, encoder reset, and PWM commands.
+Motor driver registers I’m using
+- 0x15: encoder polarity (must be 0)
+- 0x14: motor type (I write same type to all channels)
+- 0x3C: encoder total counts (read 16 bytes; write 16 zeros to reset)
+- 0x1F: fixed PWM open-loop command (-100..100)
 
-(3) i2c_read_reg_block(fd, reg, out, len)
-    - I read bytes from a register by:
-        a) writing the register address (1 byte)
-        b) reading len bytes into out
-
-(4) decode_4x_i32_le(buf16)
-    - I decode 16 raw bytes into 4 signed 32-bit integers, little-endian.
-    - This converts “wire bytes” into meaningful encoder totals.
-
-(5) MotorDriverNode constructor
-    - I declare ROS parameters so I can change behavior without recompiling:
-        i2c_bus, i2c_addr, encoder_poll_hz
-        do_pwm_test, test_pwm
-        motor_type
-        direction_sign  (+1 normal, -1 invert direction)
-    - I open the I²C bus and select the slave address.
-    - I run my board-required init sequence:
-        a) set encoder polarity (0x15) to 0
-        b) set motor type (0x14) for M1..M4
-        c) reset encoder totals (0x3C) by writing 16 zeros
-    - I stop motors by default for safety.
-    - I start:
-        - encoder_timer_ → poll_encoders()
-        - test_timer_ → run_pwm_test_once() (only if do_pwm_test=true)
-
-(6) MotorDriverNode destructor
-    - I stop motors so the robot won’t keep driving if the process exits.
-    - I close the I²C file descriptor.
-
-(7) poll_encoders()
-    - I read encoder totals from 0x3C, decode them, and print M1..M4.
-    - This helps me confirm encoder direction and motor-to-track mapping.
-
-(8) set_pwm_all(m1,m2,m3,m4)
-    - I apply direction_sign_ to each requested PWM value.
-    - Then I write the 4 signed PWM bytes to 0x1F.
-    - This is the direct actuation path.
-
-(9) stop_motors()
-    - I set all PWM outputs to 0.
-
-(10) run_pwm_test_once()
-    - If enabled, I run: forward 1s → stop 1s → backward 1s → stop.
-    - I cancel my own timer so it doesn’t repeat.
-
-(11) main()
-    - Standard ROS 2 program entry: init → spin node → shutdown.
-
-NEXT EVOLUTION (Phase 1 proper)
-- I will replace the PWM test with:
-    - /cmd_vel subscriber
-    - encoder delta → wheel velocity estimation
-    - PID closed-loop velocity control
-    - /odom publishing + TF (odom → base_link)
+Assumptions (callout)
+- Encoder totals at 0x3C are 4x int32 little-endian: M1..M4.
+- Fixed PWM at 0x1F is 4 signed bytes: M1..M4.
 
 ================================================================================
 */
@@ -127,6 +77,7 @@ NEXT EVOLUTION (Phase 1 proper)
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -136,12 +87,19 @@ NEXT EVOLUTION (Phase 1 proper)
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>
 
+#include <geometry_msgs/msg/twist.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+
 using namespace std::chrono_literals;
 
 // ===== Motor driver register addresses =====
 static constexpr uint8_t REG_ADC_BATTERY_VOLTAGE     = 0x00;
 static constexpr uint8_t REG_MOTOR_TYPE              = 0x14;
-static constexpr uint8_t REG_ENCODER_POLARITY        = 0x15;  // MUST be 0 per your note
+static constexpr uint8_t REG_ENCODER_POLARITY        = 0x15;  // must be 0 per your note
 static constexpr uint8_t REG_MOTOR_FIXED_PWM         = 0x1F;  // open-loop PWM, -100..100
 static constexpr uint8_t REG_MOTOR_FIXED_SPEED       = 0x33;  // closed-loop speed (not used yet)
 static constexpr uint8_t REG_ENCODER_TOTAL           = 0x3C;  // 4x int32 totals; reset requires 16 bytes of 0x00
@@ -161,18 +119,15 @@ static bool i2c_write_reg_block(int fd, uint8_t reg, const uint8_t* data, size_t
     fprintf(stderr, "i2c_write_reg_block: len too large\n");
     return false;
   }
-
   uint8_t buf[1 + 64];
   buf[0] = reg;
   if (len > 0) std::memcpy(buf + 1, data, len);
-
   return i2c_write_bytes(fd, buf, 1 + len);
 }
 
 static bool i2c_read_reg_block(int fd, uint8_t reg, uint8_t* out, size_t len) {
   // Pattern: write register address, then read N bytes
   if (!i2c_write_bytes(fd, &reg, 1)) return false;
-
   if (read(fd, out, len) != (ssize_t)len) {
     perror("I2C read failed");
     return false;
@@ -195,94 +150,125 @@ static std::array<int32_t, 4> decode_4x_i32_le(const uint8_t* buf16) {
   return out;
 }
 
+static int clamp_int(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static double wrap_pi(double a) {
+  // wrap angle to [-pi, pi]
+  while (a > M_PI) a -= 2.0 * M_PI;
+  while (a < -M_PI) a += 2.0 * M_PI;
+  return a;
+}
+
 // ===== ROS2 Node =====
 class MotorDriverNode : public rclcpp::Node {
 public:
   MotorDriverNode() : Node("motor_driver_node") {
-    // ---- Parameters (tunable without recompiling) ----
+    // -------- Parameters (all tweakable without recompiling) --------
     i2c_bus_ = declare_parameter<std::string>("i2c_bus", "/dev/i2c-1");
     i2c_addr_ = declare_parameter<int>("i2c_addr", 0x34);
 
-    encoder_poll_hz_ = declare_parameter<int>("encoder_poll_hz", 10);
+    // Your wiring
+    two_motor_mode_ = declare_parameter<bool>("two_motor_mode", true); // M1 left, M2 right
+    direction_sign_ = declare_parameter<int>("direction_sign", -1);     // you were using -1 earlier
+    if (direction_sign_ != 1 && direction_sign_ != -1) direction_sign_ = 1;
 
-    do_pwm_test_ = declare_parameter<bool>("do_pwm_test", false);
-    test_pwm_ = declare_parameter<int>("test_pwm", 70);  // 0..100
-
+    // Driver config
     motor_type_ = declare_parameter<int>("motor_type", 0);
 
-    // Direction fix: +1 = normal, -1 = invert forward/backward
-    direction_sign_ = declare_parameter<int>("direction_sign", 1);
-    if (direction_sign_ != 1 && direction_sign_ != -1) {
-      RCLCPP_WARN(get_logger(), "direction_sign must be +1 or -1. Using +1.");
-      direction_sign_ = 1;
+    // Odometry / kinematics
+    meters_per_tick_ = declare_parameter<double>("meters_per_tick", 0.0000874); // from your calibration
+    track_width_ = declare_parameter<double>("track_width", 0.157);             // your ruler measurement (m)
+
+    odom_frame_id_ = declare_parameter<std::string>("odom_frame_id", "odom");
+    base_frame_id_ = declare_parameter<std::string>("base_frame_id", "base_link");
+    publish_tf_ = declare_parameter<bool>("publish_tf", true);
+
+    // Update rate for encoder->odom (Hz)
+    odom_hz_ = declare_parameter<int>("odom_hz", 30);
+    if (odom_hz_ < 5) odom_hz_ = 5;
+
+    // /cmd_vel handling
+    cmd_vel_timeout_s_ = declare_parameter<double>("cmd_vel_timeout_s", 0.25);
+
+    // Simple open-loop mapping from m/s to PWM (temporary until PID)
+    // If it's too weak/strong, tweak this param.
+    mps_to_pwm_ = declare_parameter<double>("mps_to_pwm", 250.0); // (m/s) * gain -> PWM
+    max_pwm_ = declare_parameter<int>("max_pwm", 60);             // keep it conservative
+
+    // Optional: print encoders each cycle (can get spammy)
+    verbose_encoders_ = declare_parameter<bool>("verbose_encoders", false);
+
+    // -------- ROS interfaces --------
+    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("odom", 10);
+
+    cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+      "cmd_vel", 10,
+      std::bind(&MotorDriverNode::on_cmd_vel, this, std::placeholders::_1)
+    );
+
+    if (publish_tf_) {
+      tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     }
 
-    RCLCPP_INFO(get_logger(), "Starting motor driver node");
-    RCLCPP_INFO(get_logger(), "I2C bus: %s  addr: 0x%02X", i2c_bus_.c_str(), i2c_addr_);
-    RCLCPP_INFO(get_logger(), "direction_sign=%d (forward/backward invert if -1)", direction_sign_);
+    // -------- Open I2C and init board --------
+    RCLCPP_INFO(get_logger(), "Starting motor driver (I2C %s addr 0x%02X)", i2c_bus_.c_str(), i2c_addr_);
+    RCLCPP_INFO(get_logger(), "two_motor_mode=%s (M1 left, M2 right), direction_sign=%d",
+                two_motor_mode_ ? "true" : "false", direction_sign_);
+    RCLCPP_INFO(get_logger(), "meters_per_tick=%.10f, track_width=%.4f", meters_per_tick_, track_width_);
+    RCLCPP_INFO(get_logger(), "odom_hz=%d, publish_tf=%s, cmd_vel_timeout_s=%.2f",
+                odom_hz_, publish_tf_ ? "true" : "false", cmd_vel_timeout_s_);
+    RCLCPP_INFO(get_logger(), "mps_to_pwm=%.1f, max_pwm=%d", mps_to_pwm_, max_pwm_);
 
-    // ---- Open I2C bus ----
     fd_ = open(i2c_bus_.c_str(), O_RDWR);
     if (fd_ < 0) {
       perror("Failed to open I2C bus");
       throw std::runtime_error("open(i2c_bus) failed");
     }
-
-    // ---- Select device address ----
     if (ioctl(fd_, I2C_SLAVE, i2c_addr_) < 0) {
       perror("Failed to select I2C device (I2C_SLAVE)");
       throw std::runtime_error("ioctl(I2C_SLAVE) failed");
     }
 
-    // ---- Board-specific init sequence ----
-
-    // 1) Encoder polarity MUST be set to 0.
+    // 1) Encoder polarity MUST be 0
     {
       uint8_t pol[4] = {0, 0, 0, 0};
       if (!i2c_write_reg_block(fd_, REG_ENCODER_POLARITY, pol, sizeof(pol))) {
-        RCLCPP_WARN(get_logger(), "Failed to set encoder polarity to 0");
-      } else {
-        RCLCPP_INFO(get_logger(), "Encoder polarity set to 0");
+        RCLCPP_WARN(get_logger(), "Failed to set encoder polarity to 0 (0x15)");
       }
     }
 
-    // 2) Set motor type for all four motors (safe default is 0).
+    // 2) Motor type (write to all channels)
     {
       int mt = motor_type_;
       if (mt < 0) mt = 0;
       if (mt > 3) mt = 3;
       uint8_t types[4] = {(uint8_t)mt, (uint8_t)mt, (uint8_t)mt, (uint8_t)mt};
-
       if (!i2c_write_reg_block(fd_, REG_MOTOR_TYPE, types, sizeof(types))) {
         RCLCPP_WARN(get_logger(), "Failed to set motor type (0x14)");
-      } else {
-        RCLCPP_INFO(get_logger(), "Motor type set to %d (written to M1..M4)", mt);
       }
     }
 
-    // 3) Reset encoder totals: MUST write 16 bytes of 0x00 to 0x3C.
-    {
-      uint8_t zeros16[16] = {0};
-      if (!i2c_write_reg_block(fd_, REG_ENCODER_TOTAL, zeros16, sizeof(zeros16))) {
-        RCLCPP_WARN(get_logger(), "Failed to reset encoders (16-byte write to 0x3C)");
-      } else {
-        RCLCPP_INFO(get_logger(), "Encoders reset (16 bytes to 0x3C)");
-      }
-    }
+    // 3) Reset encoder totals: write 16 bytes of 0x00 to 0x3C
+    reset_encoders();
 
-    // Safety: stop motors at startup
+    // Always stop motors on startup (safety)
     stop_motors();
 
-    // ---- Encoder polling timer ----
-    if (encoder_poll_hz_ <= 0) encoder_poll_hz_ = 10;
-    auto period = std::chrono::milliseconds(1000 / encoder_poll_hz_);
-    encoder_timer_ = create_wall_timer(period, std::bind(&MotorDriverNode::poll_encoders, this));
-
-    // ---- Optional PWM test ----
-    if (do_pwm_test_) {
-      RCLCPP_WARN(get_logger(), "do_pwm_test=true: robot may move! Lift it first.");
-      test_timer_ = create_wall_timer(500ms, std::bind(&MotorDriverNode::run_pwm_test_once, this));
+    // Grab initial encoder snapshot so first delta isn't garbage
+    if (!read_encoders(last_enc_)) {
+      RCLCPP_WARN(get_logger(), "Initial encoder read failed; odometry may be weird at first");
+      last_enc_ = {0, 0, 0, 0};
     }
+
+    last_time_ = now();
+
+    // Odom update timer
+    auto period = std::chrono::milliseconds(1000 / odom_hz_);
+    odom_timer_ = create_wall_timer(period, std::bind(&MotorDriverNode::update, this));
   }
 
   ~MotorDriverNode() override {
@@ -291,42 +277,77 @@ public:
   }
 
 private:
-  // Parameters
+  // -------- Parameters / config --------
   std::string i2c_bus_;
   int i2c_addr_{0x34};
-  int encoder_poll_hz_{10};
-  bool do_pwm_test_{false};
-  int test_pwm_{70};
-  int motor_type_{0};
-  int direction_sign_{1};
 
-  // I2C file descriptor
+  bool two_motor_mode_{true};
+  int direction_sign_{-1};
+  int motor_type_{0};
+
+  double meters_per_tick_{0.0000874};
+  double track_width_{0.157};
+
+  std::string odom_frame_id_{"odom"};
+  std::string base_frame_id_{"base_link"};
+  bool publish_tf_{true};
+  int odom_hz_{30};
+
+  double cmd_vel_timeout_s_{0.25};
+
+  double mps_to_pwm_{250.0};
+  int max_pwm_{60};
+
+  bool verbose_encoders_{false};
+
+  // -------- State --------
   int fd_{-1};
 
-  // Timers
-  rclcpp::TimerBase::SharedPtr encoder_timer_;
-  rclcpp::TimerBase::SharedPtr test_timer_;
-  bool pwm_test_ran_{false};
+  // Pose in odom frame
+  double x_{0.0};
+  double y_{0.0};
+  double theta_{0.0}; // yaw
 
-  void poll_encoders() {
+  // Encoder snapshots
+  std::array<int32_t, 4> last_enc_{0, 0, 0, 0};
+
+  rclcpp::Time last_time_;
+
+  // cmd_vel target (stored)
+  double target_v_{0.0}; // m/s
+  double target_w_{0.0}; // rad/s
+  rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
+
+  // -------- ROS stuff --------
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+
+  rclcpp::TimerBase::SharedPtr odom_timer_;
+
+  // -------- I2C motor helpers --------
+  bool read_encoders(std::array<int32_t, 4>& out) {
     uint8_t buf[16]{};
-
-    if (!i2c_read_reg_block(fd_, REG_ENCODER_TOTAL, buf, sizeof(buf))) {
-      RCLCPP_ERROR(get_logger(), "Failed to read encoder totals (0x3C)");
-      return;
-    }
-
-    auto counts = decode_4x_i32_le(buf);
-
-    RCLCPP_INFO(
-      get_logger(),
-      "Encoders: M1=%d  M2=%d  M3=%d  M4=%d",
-      counts[0], counts[1], counts[2], counts[3]
-    );
+    if (!i2c_read_reg_block(fd_, REG_ENCODER_TOTAL, buf, sizeof(buf))) return false;
+    out = decode_4x_i32_le(buf);
+    return true;
   }
 
-  void set_pwm_all(int8_t m1, int8_t m2, int8_t m3, int8_t m4) {
-    // Apply direction_sign_ so I can invert forward/backward globally without rewiring.
+  void reset_encoders() {
+    uint8_t zeros16[16] = {0};
+    if (!i2c_write_reg_block(fd_, REG_ENCODER_TOTAL, zeros16, sizeof(zeros16))) {
+      RCLCPP_WARN(get_logger(), "Failed to reset encoders (16-byte write to 0x3C)");
+    }
+  }
+
+  void set_pwm_raw(int8_t m1, int8_t m2, int8_t m3, int8_t m4) {
+    // If I'm only wired for 2 motors, force unused channels to 0.
+    if (two_motor_mode_) {
+      m3 = 0;
+      m4 = 0;
+    }
+
+    // Apply direction sign globally so forward/backward is consistent.
     int8_t vals[4] = {
       (int8_t)(m1 * direction_sign_),
       (int8_t)(m2 * direction_sign_),
@@ -341,39 +362,125 @@ private:
   }
 
   void stop_motors() {
-    set_pwm_all(0, 0, 0, 0);
+    set_pwm_raw(0, 0, 0, 0);
   }
 
-  void run_pwm_test_once() {
-    if (pwm_test_ran_) return;
-    pwm_test_ran_ = true;
+  // -------- ROS callbacks / update loop --------
+  void on_cmd_vel(const geometry_msgs::msg::Twist::SharedPtr msg) {
+    target_v_ = msg->linear.x;
+    target_w_ = msg->angular.z;
+    last_cmd_time_ = now();
+  }
 
-    if (test_timer_) test_timer_->cancel();
+  void update() {
+    // --- Time delta ---
+    rclcpp::Time t = now();
+    double dt = (t - last_time_).seconds();
+    if (dt <= 0.0) dt = 1.0 / (double)odom_hz_;
+    last_time_ = t;
 
-    // Clamp test PWM
-    if (test_pwm_ < 0) test_pwm_ = 0;
-    if (test_pwm_ > 100) test_pwm_ = 100;
+    // --- Read encoders ---
+    std::array<int32_t, 4> enc{};
+    if (!read_encoders(enc)) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Encoder read failed");
+      // If encoder read fails, safest is to stop motors (optional).
+      stop_motors();
+      return;
+    }
 
-    // Forward (sign handled by direction_sign_)
-    RCLCPP_INFO(get_logger(), "PWM test: forward for 1s (PWM=%d)", test_pwm_);
-    set_pwm_all((int8_t)test_pwm_, (int8_t)test_pwm_, (int8_t)test_pwm_, (int8_t)test_pwm_);
-    sleep(1);
+    if (verbose_encoders_) {
+      RCLCPP_INFO(get_logger(), "Encoders: M1=%d M2=%d M3=%d M4=%d", enc[0], enc[1], enc[2], enc[3]);
+    }
 
-    // Stop
-    RCLCPP_INFO(get_logger(), "PWM test: stop for 1s");
-    stop_motors();
-    sleep(1);
+    // --- Compute deltas (ticks) ---
+    int32_t dL_ticks = enc[0] - last_enc_[0]; // M1 = left
+    int32_t dR_ticks = enc[1] - last_enc_[1]; // M2 = right
+    last_enc_ = enc;
 
-    // Backward (sign handled by direction_sign_)
-    RCLCPP_INFO(get_logger(), "PWM test: backward for 1s (PWM=%d)", test_pwm_);
-    set_pwm_all((int8_t)-test_pwm_, (int8_t)-test_pwm_, (int8_t)-test_pwm_, (int8_t)-test_pwm_);
-    sleep(1);
+    // Use magnitudes as physical distance; sign comes from tick deltas naturally.
+    double dL = (double)dL_ticks * meters_per_tick_;
+    double dR = (double)dR_ticks * meters_per_tick_;
 
-    // Stop
-    RCLCPP_INFO(get_logger(), "PWM test: stop");
-    stop_motors();
+    // --- Differential-drive integration ---
+    // ds = forward distance, dtheta = yaw change
+    double ds = (dR + dL) * 0.5;
 
-    RCLCPP_INFO(get_logger(), "PWM test complete");
+    // Guard against nonsense track width
+    double W = (track_width_ > 1e-6) ? track_width_ : 0.157;
+    double dtheta = (dR - dL) / W;
+
+    // "midpoint" integration helps a bit vs naive Euler
+    double theta_mid = theta_ + dtheta * 0.5;
+    x_ += ds * std::cos(theta_mid);
+    y_ += ds * std::sin(theta_mid);
+    theta_ = wrap_pi(theta_ + dtheta);
+
+    // --- Compute velocities for message (approx) ---
+    double vx = ds / dt;
+    double wz = dtheta / dt;
+
+    // --- Publish odometry ---
+    nav_msgs::msg::Odometry odom;
+    odom.header.stamp = t;
+    odom.header.frame_id = odom_frame_id_;
+    odom.child_frame_id = base_frame_id_;
+
+    odom.pose.pose.position.x = x_;
+    odom.pose.pose.position.y = y_;
+    odom.pose.pose.position.z = 0.0;
+
+    tf2::Quaternion q;
+    q.setRPY(0.0, 0.0, theta_);
+    odom.pose.pose.orientation.x = q.x();
+    odom.pose.pose.orientation.y = q.y();
+    odom.pose.pose.orientation.z = q.z();
+    odom.pose.pose.orientation.w = q.w();
+
+    odom.twist.twist.linear.x = vx;
+    odom.twist.twist.linear.y = 0.0;
+    odom.twist.twist.angular.z = wz;
+
+    // (Covariances left as zeros for now; later we’ll set something reasonable or fuse with IMU)
+    odom_pub_->publish(odom);
+
+    // --- Publish TF odom -> base_link (optional) ---
+    if (publish_tf_ && tf_broadcaster_) {
+      geometry_msgs::msg::TransformStamped tfmsg;
+      tfmsg.header.stamp = t;
+      tfmsg.header.frame_id = odom_frame_id_;
+      tfmsg.child_frame_id = base_frame_id_;
+      tfmsg.transform.translation.x = x_;
+      tfmsg.transform.translation.y = y_;
+      tfmsg.transform.translation.z = 0.0;
+      tfmsg.transform.rotation.x = q.x();
+      tfmsg.transform.rotation.y = q.y();
+      tfmsg.transform.rotation.z = q.z();
+      tfmsg.transform.rotation.w = q.w();
+      tf_broadcaster_->sendTransform(tfmsg);
+    }
+
+    // --- Simple open-loop /cmd_vel -> PWM (temporary) ---
+    // If cmd_vel is stale, stop.
+    double cmd_age = (t - last_cmd_time_).seconds();
+    if (cmd_age > cmd_vel_timeout_s_) {
+      set_pwm_raw(0, 0, 0, 0);
+      return;
+    }
+
+    // Convert base command to left/right linear velocities (m/s)
+    // left = v - w*(W/2), right = v + w*(W/2)
+    double vL = target_v_ - target_w_ * (W * 0.5);
+    double vR = target_v_ + target_w_ * (W * 0.5);
+
+    // Convert desired m/s to PWM (super rough mapping for now)
+    int pwmL = (int)std::lround(vL * mps_to_pwm_);
+    int pwmR = (int)std::lround(vR * mps_to_pwm_);
+
+    pwmL = clamp_int(pwmL, -max_pwm_, max_pwm_);
+    pwmR = clamp_int(pwmR, -max_pwm_, max_pwm_);
+
+    // Apply to M1/M2 (M3/M4 forced to 0 by two_motor_mode)
+    set_pwm_raw((int8_t)pwmL, (int8_t)pwmR, 0, 0);
   }
 };
 
